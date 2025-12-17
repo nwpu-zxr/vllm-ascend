@@ -503,6 +503,11 @@ class MooncakeLayerwiseConnectorScheduler:
             vllm_config.kv_transfer_config.kv_port +
             vllm_config.parallel_config.data_parallel_rank *
             vllm_config.parallel_config.tensor_parallel_size)
+        
+        self.executor = ThreadPoolExecutor(32)
+        self.metaserver_client = httpx.Client(
+            limits=httpx.Limits(max_connections=100000),
+            timeout=None)
 
         # Requests that need to start recv.
         # New requests are added by update_state_after_alloc in
@@ -568,7 +573,29 @@ class MooncakeLayerwiseConnectorScheduler:
                 request,
                 [],  #request._all_token_ids,
                 local_block_ids)
+            kv_transfer_params = dict(
+                token_ids=[],
+                request_id=request.request_id,
+                do_remote_prefill=False,
+                do_remote_decode=True,
+                remote_block_ids=local_block_ids,
+                remote_engine_id=self.engine_id,
+                remote_host=self.side_channel_host,
+                remote_port=self.side_channel_port,
+            )
+            future = self.executor.submit(
+                self._access_metaserver,
+                url=params.get("metaserver", None),
+                message=kv_transfer_params,
+            )
 
+            def handle_exception(future):
+                if future.exception():
+                    logger.error(
+                        f"Access metaserver fail: {future.exception()}"
+                    )
+
+            future.add_done_callback(handle_exception)
             params["do_remote_prefill"] = False
 
         # Layerwise prefiller add request need send
@@ -579,6 +606,21 @@ class MooncakeLayerwiseConnectorScheduler:
             )
             self._reqs_need_send_layerwise[request.request_id] = (len(
                 request.all_token_ids), local_block_ids, request)
+
+    def _access_metaserver(self, url, message):
+        success = False
+        retry = 0
+        while retry < 3 and success is False:
+            retry += 1
+            try:
+                self.metaserver_client.post(url, json=message)
+                success = True
+            except Exception as e:
+                logger.error(
+                    f"Failed to connect to metaserver: {url}, retry {retry} time."
+                )
+                if retry == 3:
+                    raise e
 
     def build_connector_meta(
         self,
@@ -675,11 +717,6 @@ class MooncakeLayerwiseConnectorWorker:
         self.side_channel_host = get_ip()
         self.total_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config)
-
-        self.executor = ThreadPoolExecutor(32)
-        self.metaserver_client = httpx.Client(
-            limits=httpx.Limits(max_connections=100000),
-            timeout=None) if self.tp_rank == 0 else None
 
         # Handshake base port
         self.side_channel_port = (
@@ -834,21 +871,6 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_recv_layer_thread.start()
             ready_event.wait()
 
-    def _access_metaserver(self, url, message):
-        success = False
-        retry = 0
-        while retry < 3 and success is False:
-            retry += 1
-            try:
-                self.metaserver_client.post(url, json=message)
-                success = True
-            except Exception as e:
-                logger.error(
-                    f"Failed to connect to metaserver: {url}, retry {retry} time."
-                )
-                if retry == 3:
-                    raise e
-
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (
             self.kv_recv_layer_thread.
@@ -865,35 +887,6 @@ class MooncakeLayerwiseConnectorWorker:
         self.current_layer = 0
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             for req_id, meta in metadata.requests.items():
-                if self.tp_rank % self.tp_size == 0:
-                    logger.info(
-                        f"Send request: {req_id} to proxy metaserver: {meta.metaserver}"
-                    )
-                    # All parameters here should appear in the returned dict of
-                    # request_finished in the scheduler side except "request_id".
-                    kv_transfer_params = dict(
-                        token_ids=meta.token_ids,
-                        request_id=req_id,
-                        do_remote_prefill=False,
-                        do_remote_decode=True,
-                        remote_block_ids=meta.local_block_ids,
-                        remote_engine_id=self.engine_id,
-                        remote_host=self.side_channel_host,
-                        remote_port=self.side_channel_port,
-                    )
-                    future = self.executor.submit(
-                        self._access_metaserver,
-                        url=meta.metaserver,
-                        message=kv_transfer_params,
-                    )
-
-                    def handle_exception(future):
-                        if future.exception():
-                            logger.error(
-                                f"Access metaserver fail: {future.exception()}"
-                            )
-
-                    future.add_done_callback(handle_exception)
                 assert self.kv_recv_layer_thread is not None
                 with self.kv_recv_layer_thread.lock:
                     self.kv_recv_layer_thread.task_tracker[req_id] = 0
