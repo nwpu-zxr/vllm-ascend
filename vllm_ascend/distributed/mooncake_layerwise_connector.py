@@ -144,7 +144,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     raise RuntimeError("Mooncake memory registration failed. ")
 
         self.send_queue = queue.Queue[Tuple[str, ReqMeta, int, torch.Tensor,
-                                            torch.Tensor]]()
+                                            torch.Tensor, torch.npu.Event]]()
 
         self.ready_event = ready_event
         self.callback_func = callback_func
@@ -155,15 +155,15 @@ class KVCacheSendingLayerThread(threading.Thread):
         torch.npu.set_device(device)
         self.ready_event.set()
         while True:
-            req_id, req_meta, layer_index, key, value = self.send_queue.get()
-            self._handle_request(req_id, req_meta, layer_index, key, value)
+            req_id, req_meta, layer_index, key, value, reshape_cache_event = self.send_queue.get()
+            self._handle_request(req_id, req_meta, layer_index, key, value, reshape_cache_event)
 
-    def _handle_request(self, req_id, req_meta, layer_index, key, value):
+    def _handle_request(self, req_id, req_meta, layer_index, key, value, reshape_cache_event):
         try:
             logger.debug(
                 f"Starting to transfer KV cache for request {req_id} {req_meta.remote_te_rpc_port=}."
             )
-            self._transfer_kv_cache(req_id, req_meta, layer_index, key, value)
+            self._transfer_kv_cache(req_id, req_meta, layer_index, key, value, reshape_cache_event)
             logger.debug(
                 f"Finished transferring KV cache for request {req_id} {req_meta.remote_te_rpc_port=}."
             )
@@ -171,7 +171,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             logger.error("Failed to transfer KV cache for request "
                          f"{req_id}: {e}")
 
-    def _transfer_kv_cache(self, req_id, req_meta, layer_index, key, value):
+    def _transfer_kv_cache(self, req_id, req_meta, layer_index, key, value, reshape_cache_event):
         # send kv layer to remote
         if len(req_meta.local_block_ids) == 0:
             logger.debug(
@@ -227,7 +227,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     length_list.append(length)
             if self.current_layer != layer_index:
                 self.current_layer = layer_index
-                self.model_stream.synchronize()
+                reshape_cache_event.synchronize()
             ret = self.engine.batch_transfer_sync_write(
                 session_id, src_list, dst_list, length_list)
             if ret < 0:
@@ -906,6 +906,7 @@ class MooncakeLayerwiseConnectorWorker:
         """MooncakeLayerwiseConnector does not save explicitly."""
         if self.vllm_config.kv_transfer_config.is_kv_producer and connector_metadata.requests.keys(
         ):
+            reshape_cache_event = attn_metadata.reshape_cache_event
             # enable decode prefix cache
             for request in connector_metadata.requests.values():
                 assert len(request.local_block_ids) >= len(
@@ -965,7 +966,7 @@ class MooncakeLayerwiseConnectorWorker:
                 )
                 assert self.kv_send_layer_thread is not None
                 self.kv_send_layer_thread.send_queue.put(
-                    (req_id, req_meta_update, self.current_layer, key, value))
+                    (req_id, req_meta_update, self.current_layer, key, value, reshape_cache_event))
             self.current_layer += 1
 
     def _get_remote_socket(

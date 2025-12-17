@@ -187,6 +187,7 @@ class AscendMLAMetadata:
 
     decode: Optional[AscendMLADecodeMetadata] = None
     prefill: Optional[AscendMLAPrefillMetadata] = None
+    reshape_cache_event: torch.npu.Event = None
 
     def __post_init__(self):
         pass
@@ -1388,8 +1389,14 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_slots = attn_metadata.slot_mapping[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
+            use_layerwise_connector = get_current_vllm_config().kv_transfer_config.kv_connector == "MooncakeLayerwiseConnector" and get_current_vllm_config().kv_transfer_config.is_kv_producer
+            if use_layerwise_connector:
+                reshape_cache_event = torch.npu.Event()
+                attn_metadata.reshape_cache_event = reshape_cache_event
             prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                 prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
+            if use_layerwise_connector:
+                reshape_cache_event.record()
             prefill_k_nope, prefill_value = self.kv_b_proj(
                 prefill_k_c_normed)[0].view(
                     -1, self.num_heads,

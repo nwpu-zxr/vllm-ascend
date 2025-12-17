@@ -226,6 +226,7 @@ class AscendMetadata:
     # Whether is the pooling model with causal attention,
     # used to guide the attention computation for pooling models.
     is_causal_pooling: Optional[bool] = None
+    reshape_cache_event: torch.npu.Event = None
 
 
 class AscendAttentionMetadataBuilder:
@@ -726,6 +727,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
 
         if len(kv_cache) > 1:
+            use_layerwise_connector = get_current_vllm_config().kv_transfer_config.kv_connector == "MooncakeLayerwiseConnector" and get_current_vllm_config().kv_transfer_config.is_kv_producer
+            if use_layerwise_connector:
+                reshape_cache_event = torch.npu.Event()
+                attn_metadata.reshape_cache_event = reshape_cache_event
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
@@ -746,6 +751,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
                     slot_indices=slots[:attn_metadata.num_actual_tokens])
+            if use_layerwise_connector:
+                reshape_cache_event.record()
         return key, value
 
     def forward_impl(
