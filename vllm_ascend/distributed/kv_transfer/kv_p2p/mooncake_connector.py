@@ -494,8 +494,18 @@ class KVCacheRecvingThread(threading.Thread):
         )
         self.use_mla = self.model_config.is_deepseek_mla
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
-        self.sfa_dcp_replicate_k = self.use_sparse and (self.vllm_config.additional_config or {}).get(
-            "sfa_dcp_replicate_k", False
+        hf_text_config = getattr(self.model_config, "hf_text_config", None)
+        hf_config = getattr(self.model_config, "hf_config", hf_text_config)
+        compress_ratios = getattr(hf_text_config, "compress_ratios", None)
+        if compress_ratios is None:
+            compress_ratios = getattr(hf_config, "compress_ratios", None)
+        self.use_compress = isinstance(compress_ratios, (list, tuple, dict))
+        parallel_config = self.vllm_config.parallel_config
+        self.enable_sfa_dcp_replicated_indexer = (
+            self.use_sparse
+            and not self.use_compress
+            and parallel_config.decode_context_parallel_size == self.tp_size
+            and parallel_config.prefill_context_parallel_size == 1
         )
         self.is_hma_required = is_hma_required
         self.block_size = self.vllm_config.cache_config.block_size
@@ -820,7 +830,7 @@ class KVCacheRecvingThread(threading.Thread):
                 grouped_remote_block_ids = [[remote_group_block_ids[transfer_block_idx]]]
                 grouped_local_block_ids = [[local_group_block_ids[0]]]
 
-            if self.sfa_dcp_replicate_k and local_block_ids_replicate_k:
+            if self.enable_sfa_dcp_replicated_indexer and local_block_ids_replicate_k:
                 grouped_remote_k_block_ids, grouped_local_k_block_ids = group_concurrent_contiguous(
                     remote_block_ids_replicate_k[0],
                     local_block_ids_replicate_k[0],
@@ -871,7 +881,7 @@ class KVCacheRecvingThread(threading.Thread):
                     block_stride = self.block_stride_per_addr[layer_idx][cache_idx]
                     remote_block_stride = remote_block_stride_per_addr[layer_idx][cache_idx]
                     inner_block_len = block_len // tp_num_need_pulls
-                    if self.sfa_dcp_replicate_k and self.block_size_scale[layer_idx][cache_idx] > 1:
+                    if self.enable_sfa_dcp_replicated_indexer and self.block_size_scale[layer_idx][cache_idx] > 1:
                         if local_block_ids_replicate_k:
                             transfer_remote_block_ids = grouped_remote_k_block_ids
                             transfer_local_block_ids = grouped_local_k_block_ids
@@ -2214,8 +2224,17 @@ class MooncakeConnectorWorker:
         """Register the KV Cache data."""
         self.use_mla = self.vllm_config.model_config.is_deepseek_mla
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
-        self.sfa_dcp_replicate_k = self.use_sparse and (self.vllm_config.additional_config or {}).get(
-            "sfa_dcp_replicate_k", False
+        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", hf_text_config)
+        compress_ratios = getattr(hf_text_config, "compress_ratios", None)
+        if compress_ratios is None:
+            compress_ratios = getattr(hf_config, "compress_ratios", None)
+        self.use_compress = isinstance(compress_ratios, (list, tuple, dict))
+        self.enable_sfa_dcp_replicated_indexer = (
+            self.use_sparse
+            and not self.use_compress
+            and self.dcp_size == self.tp_size
+            and self.pcp_size == 1
         )
 
         self.num_blocks = self.kv_cache_config.num_blocks
@@ -3174,12 +3193,14 @@ class MooncakeConnectorWorker:
             tp_num_need_pulls=num_group_pulls,
             use_mla=num_key_value_heads == 1,
         )[self.tp_rank]
+
     def _get_sfa_replicate_k_remote_handshake_port(
         self,
         meta: ReqMeta,
     ) -> int | None:
-        if not self.sfa_dcp_replicate_k:
+        if not self.enable_sfa_dcp_replicated_indexer:
             return None
+        assert meta.remote_pcp_size == 1 and meta.remote_dcp_size == meta.remote_ptp_size
         remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
         local_cp_size = self.pcp_size * self.dcp_size
         if local_cp_size == 0 or remote_cp_size % local_cp_size != 0:
@@ -3195,7 +3216,7 @@ class MooncakeConnectorWorker:
         self,
         meta: ReqMeta,
     ) -> tuple[BlockIds, BlockIds]:
-        if not self.sfa_dcp_replicate_k:
+        if not self.enable_sfa_dcp_replicated_indexer:
             return tuple(), tuple()
         if meta.num_external_tokens <= 0 or not meta.remote_block_ids or not meta.local_block_ids:
             return tuple(), tuple()

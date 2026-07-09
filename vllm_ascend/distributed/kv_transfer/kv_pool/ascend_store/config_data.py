@@ -14,6 +14,7 @@ from vllm.v1.core.sched.output import NewRequestData
 
 _GROUPED_BLOCK_HASH_DOMAIN = b"vllm-ascend-grouped-block-hash-v1\0"
 _GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES = 4
+REPLICATE_K_CACHE_ROLE = "replicate_k"
 
 
 # Parameters related to the key
@@ -271,12 +272,14 @@ class ChunkedTokenDatabase:
         if cache_family is None:
             cache_family = self.group_cache_families.get(cache_role, {}).get(kv_cache_group_id, "default")
         group_metadata = self.metadata[kv_cache_group_id]
+        pcp_rank = 0 if cache_role == REPLICATE_K_CACHE_ROLE else group_metadata.pcp_rank
+        dcp_rank = 0 if cache_role == REPLICATE_K_CACHE_ROLE else group_metadata.dcp_rank
         return PoolKey(
             KeyMetadata(
                 model_name=group_metadata.model_name,
                 head_or_tp_rank=group_metadata.head_or_tp_rank,
-                pcp_rank=group_metadata.pcp_rank,
-                dcp_rank=group_metadata.dcp_rank,
+                pcp_rank=pcp_rank,
+                dcp_rank=dcp_rank,
                 pp_rank=group_metadata.pp_rank,
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
@@ -303,6 +306,14 @@ class ChunkedTokenDatabase:
             # Keep the interface for future explicit state groups, but this
             # DSV4 branch stores compressor/indexer states in kv_caches.
             pass
+        elif cache_role == REPLICATE_K_CACHE_ROLE:
+            if not hasattr(self, "group_kv_caches_base_addr_by_role"):
+                self.group_kv_caches_base_addr_by_role: dict[str, dict[int, list[int]]] = {}
+                self.group_block_len_by_role: dict[str, dict[int, list[int]]] = {}
+                self.group_block_stride_by_role: dict[str, dict[int, list[int]]] = {}
+            self.group_kv_caches_base_addr_by_role[cache_role] = group_kv_caches_base_addr
+            self.group_block_len_by_role[cache_role] = group_block_len
+            self.group_block_stride_by_role[cache_role] = group_block_stride or {}
         else:
             self.group_kv_caches_base_addr = group_kv_caches_base_addr
             self.group_block_len = group_block_len
@@ -317,11 +328,29 @@ class ChunkedTokenDatabase:
     ) -> tuple[list[int], list[int], list[int] | None]:
         if cache_role == "state":
             return [], [], []
+        if cache_role == REPLICATE_K_CACHE_ROLE:
+            role_addrs = getattr(self, "group_kv_caches_base_addr_by_role", {}).get(cache_role, {})
+            role_lens = getattr(self, "group_block_len_by_role", {}).get(cache_role, {})
+            role_strides = getattr(self, "group_block_stride_by_role", {}).get(cache_role, {})
+            return (
+                role_addrs.get(kv_cache_group_id, []),
+                role_lens.get(kv_cache_group_id, []),
+                role_strides.get(kv_cache_group_id),
+            )
         return (
             self.group_kv_caches_base_addr[kv_cache_group_id],
             self.group_block_len[kv_cache_group_id],
             self.group_block_stride.get(kv_cache_group_id),
         )
+
+    def get_cache_roles(self, kv_cache_group_id: int = 0) -> list[str]:
+        roles = ["kv"]
+        replicate_k_buffers = getattr(self, "group_kv_caches_base_addr_by_role", {}).get(
+            REPLICATE_K_CACHE_ROLE, {}
+        )
+        if replicate_k_buffers.get(kv_cache_group_id):
+            roles.append(REPLICATE_K_CACHE_ROLE)
+        return roles
 
     def prepare_value(
         self,

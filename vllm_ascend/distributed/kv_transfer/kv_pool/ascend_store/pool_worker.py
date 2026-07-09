@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    REPLICATE_K_CACHE_ROLE,
     AscendConnectorMetadata,
     AscendStoreKVConnectorWorkerMetadata,
     ChunkedTokenDatabase,
@@ -102,6 +103,12 @@ class KVPoolWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
+        self.enable_sfa_dcp_replicated_indexer = (
+            self.use_sparse
+            and not self.use_compress
+            and self.dcp_size == self.tp_size
+            and self.pcp_size == 1
+        )
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
@@ -130,6 +137,13 @@ class KVPoolWorker:
         self.kv_cache_group_families = self._infer_group_families()
         self.group_uses_align_state = self._infer_group_uses_align_state()
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
+        if self.enable_sfa_dcp_replicated_indexer:
+            if self.use_layerwise:
+                raise NotImplementedError("AscendStore layerwise mode does not yet support SFA replicate-K.")
+            if self.num_kv_cache_groups != 1:
+                raise NotImplementedError("AscendStore SFA replicate-K currently expects exactly one KV cache group.")
+            if self.pcp_size != 1:
+                raise NotImplementedError("AscendStore SFA replicate-K currently supports DCP-only pooling.")
         if self.use_layerwise and self.num_kv_cache_groups > 1:
             raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
 
@@ -352,18 +366,35 @@ class KVPoolWorker:
         group_addrs: list[int] = []
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
+        replicate_k_group_addrs: list[int] = []
+        replicate_k_group_block_lens: list[int] = []
+        replicate_k_group_block_strides: list[int] = []
         for layer_name in layer_names:
             cache_or_caches = self.kv_caches[layer_name]
             for cache in self._as_cache_tuple(cache_or_caches):
                 base_addr = cache.data_ptr()
-                block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
-                group_addrs.append(base_addr)
-                group_block_lens.append(block_len)
-                group_block_strides.append(block_stride)
+                block_len, block_stride, _, block_size_scale = self._get_cache_block_metadata(cache)
+                if self.enable_sfa_dcp_replicated_indexer and block_size_scale > 1:
+                    assert block_size_scale == self.dcp_size, (
+                        f"AscendStore SFA replicate-K expects full-K cache block scale({block_size_scale}) "
+                        f"to match dcp_size({self.dcp_size})."
+                    )
+                    replicate_k_group_addrs.append(base_addr)
+                    replicate_k_group_block_lens.append(block_len)
+                    replicate_k_group_block_strides.append(block_stride)
+                else:
+                    group_addrs.append(base_addr)
+                    group_block_lens.append(block_len)
+                    group_block_strides.append(block_stride)
         self.group_kv_caches_base_addr[group_id] = group_addrs
         self.group_block_len[group_id] = group_block_lens
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(layer_names)
+        if replicate_k_group_addrs:
+            self.replicate_k_group_kv_caches_base_addr[group_id] = replicate_k_group_addrs
+            self.replicate_k_group_block_len[group_id] = replicate_k_group_block_lens
+            self.replicate_k_group_block_stride[group_id] = replicate_k_group_block_strides
+            self.replicate_k_group_num_layers[group_id] = len(layer_names)
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
         """
@@ -396,19 +427,34 @@ class KVPoolWorker:
         self.group_kv_caches_base_addr: dict[int, list[int]] = {}
         self.group_block_len: dict[int, list[int]] = {}
         self.group_block_stride: dict[int, list[int]] = {}
+        if self.enable_sfa_dcp_replicated_indexer:
+            self.replicate_k_group_kv_caches_base_addr: dict[int, list[int]] = {}
+            self.replicate_k_group_block_len: dict[int, list[int]] = {}
+            self.replicate_k_group_block_stride: dict[int, list[int]] = {}
         self.kv_caches = kv_caches
         self.group_kv_cache_families: dict[int, str] = {
             group_id: self._get_group_family(self.kv_cache_group_families, group_id)
             for group_id in range(self.num_kv_cache_groups)
         }
         self.group_num_layers: dict[int, int] = {}
+        if self.enable_sfa_dcp_replicated_indexer:
+            self.replicate_k_group_num_layers: dict[int, int] = {}
 
-        logger.info(
-            "Registering KV_Caches. use_mla: %s, use_sparse: %s, shape %s",
-            self.use_mla,
-            self.use_sparse,
-            first_kv_cache.shape,
-        )
+        if self.enable_sfa_dcp_replicated_indexer:
+            logger.info(
+                "Registering KV_Caches. use_mla: %s, use_sparse: %s, enable_sfa_dcp_replicated_indexer: %s, shape %s",
+                self.use_mla,
+                self.use_sparse,
+                self.enable_sfa_dcp_replicated_indexer,
+                first_kv_cache.shape,
+            )
+        else:
+            logger.info(
+                "Registering KV_Caches. use_mla: %s, use_sparse: %s, shape %s",
+                self.use_mla,
+                self.use_sparse,
+                first_kv_cache.shape,
+            )
 
         registered_regions: dict[int, tuple[int, int]] = {}
         for cache_or_caches in kv_caches.values():
@@ -457,6 +503,15 @@ class KVPoolWorker:
             group_cache_families=self.group_kv_cache_families,
             group_num_layers=self.group_num_layers,
         )
+        if self.enable_sfa_dcp_replicated_indexer and self.replicate_k_group_kv_caches_base_addr:
+            self.token_database.set_group_buffers(
+                self.replicate_k_group_kv_caches_base_addr,
+                self.replicate_k_group_block_len,
+                self.replicate_k_group_block_stride,
+                cache_role=REPLICATE_K_CACHE_ROLE,
+                group_cache_families=self.group_kv_cache_families,
+                group_num_layers=self.replicate_k_group_num_layers,
+            )
 
         if self.use_layerwise:
             self.get_event = threading.Event()
@@ -573,28 +628,35 @@ class KVPoolWorker:
                     block_ids = request.block_ids_by_group[group_id]
                     group_block_size = self.grouped_block_size[group_id]
                     mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
-                    skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
-                    for start, end, key, block_id in self.token_database.process_tokens_with_block_ids(
-                        token_len,
-                        request.block_hashes,
-                        block_ids,
-                        mask_num,
-                        kv_cache_group_id=group_id,
-                        skip_null_blocks=skip_null,
-                    ):
-                        if not self.token_database.mask_allows_chunk(load_masks, group_id, start):
-                            continue
-                        addr, size, block_id = self.token_database.prepare_value(
-                            start,
-                            end,
-                            block_ids,
-                            kv_cache_group_id=group_id,
-                            block_id=block_id,
+                    for cache_role in self.token_database.get_cache_roles(group_id):
+                        skip_null = (
+                            cache_role == "kv"
+                            and group_id < len(self.group_uses_align_state)
+                            and self.group_uses_align_state[group_id]
                         )
-                        key_list.append(key.to_string())
-                        addr_list.append(addr)
-                        size_list.append(size)
-                        block_id_list.append(block_id)
+                        for start, end, key, block_id in self.token_database.process_tokens_with_block_ids(
+                            token_len,
+                            request.block_hashes,
+                            block_ids,
+                            mask_num,
+                            kv_cache_group_id=group_id,
+                            skip_null_blocks=skip_null,
+                            cache_role=cache_role,
+                        ):
+                            if not self.token_database.mask_allows_chunk(load_masks, group_id, start):
+                                continue
+                            addr, size, block_id = self.token_database.prepare_value(
+                                start,
+                                end,
+                                block_ids,
+                                kv_cache_group_id=group_id,
+                                cache_role=cache_role,
+                                block_id=block_id,
+                            )
+                            key_list.append(key.to_string())
+                            addr_list.append(addr)
+                            size_list.append(size)
+                            block_id_list.append(block_id)
                 if not key_list:
                     continue
                 key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
@@ -955,52 +1017,56 @@ class KVPoolWorker:
             if coordinator_hit is not None:
                 return coordinator_hit
             for group_id in kv_cache_group_ids:
-                end = 0
-                keys = []
-                starts = []
-                ends = []
-                for start, end, key in self.token_database.process_tokens(
-                    token_len,
-                    block_hashes,
-                    kv_cache_group_id=group_id,
-                ):
+                role_hits: list[int] = []
+                for cache_role in self.token_database.get_cache_roles(group_id):
+                    end = 0
+                    keys = []
+                    starts = []
+                    ends = []
+                    for start, end, key in self.token_database.process_tokens(
+                        token_len,
+                        block_hashes,
+                        kv_cache_group_id=group_id,
+                        cache_role=cache_role,
+                    ):
+                        if use_layerwise:
+                            keys_multi_layer = key.split_layers(self.num_layers)
+                            for item in keys_multi_layer:
+                                keys.append(item.to_string())
+                        else:
+                            keys.append(key.to_string())
+                        starts.append(start)
+                        ends.append(end)
+
+                    if not keys:
+                        role_hits.append(0)
+                        continue
+
+                    res = self.m_store.exists(keys)  # type: ignore[assignment]
+
                     if use_layerwise:
-                        keys_multi_layer = key.split_layers(self.num_layers)
-                        for item in keys_multi_layer:
-                            keys.append(item.to_string())
+                        res = self.check_all_layers_exists(res, self.num_layers)
+                    if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]:
+                        hit_end = 0
+                        for index in range(len(ends) - 1, -1, -1):
+                            if (
+                                res[index] == 1  # type: ignore[index]
+                                and ends[index] % self.cache_transfer_granularity == 0
+                            ):
+                                hit_end = ends[index]
+                                break
                     else:
-                        keys.append(key.to_string())
-                    starts.append(start)
-                    ends.append(end)
-
-                if not keys:
-                    hits.append(0)
-                    continue
-
-                res = self.m_store.exists(keys)  # type: ignore[assignment]
-
-                if use_layerwise:
-                    res = self.check_all_layers_exists(res, self.num_layers)
-                if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]:
-                    hit_end = 0
-                    for index in range(len(ends) - 1, -1, -1):
-                        if (
-                            res[index] == 1  # type: ignore[index]
-                            and ends[index] % self.cache_transfer_granularity == 0
-                        ):
-                            hit_end = ends[index]
-                            break
-                else:
-                    hit_end = end
-                    for index, value in enumerate(res):  # type: ignore[arg-type]
-                        if value != 1:
-                            hit_end = 0
-                            for hit_index in range(index, 0, -1):
-                                if starts[hit_index] % self.cache_transfer_granularity == 0:
-                                    hit_end = starts[hit_index]
-                                    break
-                            break
-                hits.append(hit_end)
+                        hit_end = end
+                        for index, value in enumerate(res):  # type: ignore[arg-type]
+                            if value != 1:
+                                hit_end = 0
+                                for hit_index in range(index, 0, -1):
+                                    if starts[hit_index] % self.cache_transfer_granularity == 0:
+                                        hit_end = starts[hit_index]
+                                        break
+                                break
+                    role_hits.append(hit_end)
+                hits.append(min(role_hits) if role_hits else 0)
         except Exception as e:
             logger.error(
                 "Remote connection failed in get_common_prefix_length. type=%s, error=%s. "
@@ -1070,37 +1136,66 @@ class KVPoolWorker:
 
         exists: set[tuple[int, bytes]] = set()
         for group_id in kv_cache_group_ids:
-            keys: list[str] = []
-            chunk_hashes: list[str] = []
-            variant_counts: list[int] = []
-            for _, _, key in self.token_database.process_tokens(
-                token_len,
-                block_hashes,
-                kv_cache_group_id=group_id,
-            ):
-                variants = self._expand_lookup_key_variants(key.to_string(), group_id, include_all_ranks)
-                keys.extend(variants)
-                chunk_hashes.append(key.chunk_hash)
-                variant_counts.append(len(variants))
+            role_exists: list[set[bytes]] = []
+            total_keys = 0
+            chunk_count = 0
+            sample_keys: list[str] = []
+            for cache_role in self.token_database.get_cache_roles(group_id):
+                keys: list[str] = []
+                chunk_hashes: list[str] = []
+                variant_counts: list[int] = []
+                for _, _, key in self.token_database.process_tokens(
+                    token_len,
+                    block_hashes,
+                    kv_cache_group_id=group_id,
+                    cache_role=cache_role,
+                ):
+                    variants = self._expand_lookup_key_variants(key.to_string(), group_id, include_all_ranks)
+                    keys.extend(variants)
+                    chunk_hashes.append(key.chunk_hash)
+                    variant_counts.append(len(variants))
 
-            if not keys:
-                continue
-            res = self.m_store.exists(keys)  # type: ignore[assignment]
-            offset = 0
-            for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
-                values = res[offset : offset + count]  # type: ignore[index]
-                if values and all(value == 1 for value in values):
-                    exists.add((group_id, self._chunk_hash_to_bytes(chunk_hash)))
-                offset += count
+                if not keys:
+                    role_exists.append(set())
+                    continue
+                total_keys += len(keys)
+                chunk_count = max(chunk_count, len(chunk_hashes))
+                if not sample_keys:
+                    sample_keys = keys[:3]
+                res = self.m_store.exists(keys)  # type: ignore[assignment]
+                offset = 0
+                role_chunks: set[bytes] = set()
+                for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
+                    values = res[offset : offset + count]  # type: ignore[index]
+                    if values and all(value == 1 for value in values):
+                        role_chunks.add(self._chunk_hash_to_bytes(chunk_hash))
+                    offset += count
+                role_exists.append(role_chunks)
+
+                logger.debug(
+                    "KV pool coordinator lookup group=%d role=%s token_len=%d keys=%d "
+                    "exists_chunks=%d/%d sample_keys=%s",
+                    group_id,
+                    cache_role,
+                    token_len,
+                    len(keys),
+                    len(role_chunks),
+                    len(chunk_hashes),
+                    keys[:3],
+                )
+
+            if role_exists:
+                for chunk_hash in set(role_exists[0]).intersection(*role_exists[1:]):
+                    exists.add((group_id, chunk_hash))
 
             logger.debug(
                 "KV pool coordinator lookup group=%d token_len=%d keys=%d exists_chunks=%d/%d sample_keys=%s",
                 group_id,
                 token_len,
-                len(keys),
+                total_keys,
                 sum(1 for group, _ in exists if group == group_id),
-                len(chunk_hashes),
-                keys[:3],
+                chunk_count,
+                sample_keys,
             )
 
         _, hit_length = self.cache_coordinator.find_longest_cache_hit(
@@ -1143,83 +1238,95 @@ class KVPoolWorker:
             if coordinator_hit is not None:
                 return coordinator_hit
             for group_id in kv_cache_group_ids:
-                keys = []
-                starts = []
-                ends = []
-                for start, end, key in self.token_database.process_tokens(
-                    token_len,
-                    block_hashes,
-                    kv_cache_group_id=group_id,
-                ):
+                role_hit_positions: list[list[int]] = []
+                for cache_role in self.token_database.get_cache_roles(group_id):
+                    keys = []
+                    starts = []
+                    ends = []
+                    for start, end, key in self.token_database.process_tokens(
+                        token_len,
+                        block_hashes,
+                        kv_cache_group_id=group_id,
+                        cache_role=cache_role,
+                    ):
+                        if use_layerwise:
+                            keys_multi_layer = key.split_layers(self.num_layers)
+                            for item in keys_multi_layer:
+                                keys.append(item.to_string())
+                        else:
+                            keys.append(key.to_string())
+                        starts.append(start)
+                        ends.append(end)
+
+                    if not keys:
+                        return 0
+
+                    multi_tp_keys = keys[:]
+                    group_tp_size = self.get_group_tp_size(group_id)
+                    for i in range(1, group_tp_size):
+                        for item in keys:
+                            new_str = item.replace(  # type: ignore[attr-defined]
+                                "@head_or_tp_rank:0", f"@head_or_tp_rank:{i}", 1
+                            )
+                            multi_tp_keys.append(new_str)
+
+                    pp_base_keys = multi_tp_keys.copy()
+                    for i in range(1, self.pp_size):
+                        for item in pp_base_keys:
+                            new_str = item.replace(  # type: ignore[attr-defined]
+                                "@pp_rank:0", f"@pp_rank:{i}", 1
+                            )
+                            multi_tp_keys.append(new_str)
+
+                    res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
+                    num_block = len(keys)
                     if use_layerwise:
-                        keys_multi_layer = key.split_layers(self.num_layers)
-                        for item in keys_multi_layer:
-                            keys.append(item.to_string())
+                        res = self.check_all_layers_exists(res, self.num_layers)
+                        num_block = len(keys) // self.num_layers
+                    multi_tp_values = [
+                        res[i * num_block : (i + 1) * num_block]  # type: ignore[index]
+                        for i in range(group_tp_size * self.pp_size)
+                    ]
+                    logger.debug(
+                        "KV pool lookup request token_len=%d group=%d role=%s keys=%d multi_tp_keys=%d "
+                        "exists_count=%d/%d exists_sample=%s sample_keys=%s",
+                        token_len,
+                        group_id,
+                        cache_role,
+                        len(keys),
+                        len(multi_tp_keys),
+                        sum(1 for value in res if value == 1),  # type: ignore[union-attr]
+                        len(res),
+                        list(res[: min(12, len(res))]),  # type: ignore[index]
+                        multi_tp_keys[:3],
+                    )
+                    if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]:
+                        group_hits = self.find_all_discontinuous_hit_positions(
+                            multi_tp_values, ends, num_block, max_hit_position, self.cache_transfer_granularity
+                        )
                     else:
-                        keys.append(key.to_string())
-                    starts.append(start)
-                    ends.append(end)
-
-                if not keys:
+                        group_hits = self.find_all_continuous_hit_positions(
+                            multi_tp_values, ends, num_block, max_hit_position, self.cache_transfer_granularity
+                        )
+                    if not group_hits:
+                        return 0
+                    role_hit_positions.append(group_hits)
+                    max_hit_position = min(max_hit_position, group_hits[-1])
+                    logger.debug(
+                        "KV pool scheduler lookup group=%d role=%s keys=%d hit=%d token_len=%d",
+                        group_id,
+                        cache_role,
+                        len(keys),
+                        group_hits[-1],
+                        token_len,
+                    )
+                if not role_hit_positions:
                     return 0
-
-                multi_tp_keys = keys[:]
-                group_tp_size = self.get_group_tp_size(group_id)
-                for i in range(1, group_tp_size):
-                    for item in keys:
-                        new_str = item.replace(  # type: ignore[attr-defined]
-                            "@head_or_tp_rank:0", f"@head_or_tp_rank:{i}", 1
-                        )
-                        multi_tp_keys.append(new_str)
-
-                pp_base_keys = multi_tp_keys.copy()
-                for i in range(1, self.pp_size):
-                    for item in pp_base_keys:
-                        new_str = item.replace(  # type: ignore[attr-defined]
-                            "@pp_rank:0", f"@pp_rank:{i}", 1
-                        )
-                        multi_tp_keys.append(new_str)
-
-                res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
-                num_block = len(keys)
-                if use_layerwise:
-                    res = self.check_all_layers_exists(res, self.num_layers)
-                    num_block = len(keys) // self.num_layers
-                multi_tp_values = [
-                    res[i * num_block : (i + 1) * num_block]  # type: ignore[index]
-                    for i in range(group_tp_size * self.pp_size)
-                ]
-                logger.debug(
-                    "KV pool lookup request token_len=%d group=%d keys=%d multi_tp_keys=%d "
-                    "exists_count=%d/%d exists_sample=%s sample_keys=%s",
-                    token_len,
-                    group_id,
-                    len(keys),
-                    len(multi_tp_keys),
-                    sum(1 for value in res if value == 1),  # type: ignore[union-attr]
-                    len(res),
-                    list(res[: min(12, len(res))]),  # type: ignore[index]
-                    multi_tp_keys[:3],
-                )
-                if group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]:
-                    group_hits = self.find_all_discontinuous_hit_positions(
-                        multi_tp_values, ends, num_block, max_hit_position, self.cache_transfer_granularity
-                    )
-                else:
-                    group_hits = self.find_all_continuous_hit_positions(
-                        multi_tp_values, ends, num_block, max_hit_position, self.cache_transfer_granularity
-                    )
+                group_hits = sorted(set(role_hit_positions[0]).intersection(*role_hit_positions[1:]))
                 if not group_hits:
                     return 0
                 max_hit_position = min(max_hit_position, group_hits[-1])
                 hits.append(group_hits)
-                logger.debug(
-                    "KV pool scheduler lookup group=%d keys=%d hit=%d token_len=%d",
-                    group_id,
-                    len(keys),
-                    max_hit_position,
-                    token_len,
-                )
         except Exception as e:
             logger.error(
                 "Remote connection failed in lookup. type=%s, error=%s. Check network and remote store.",
