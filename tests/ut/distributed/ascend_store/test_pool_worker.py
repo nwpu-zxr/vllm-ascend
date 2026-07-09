@@ -119,6 +119,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         key.chunk_hash = "ab" * 32
         key.to_string.return_value = "key"
         worker.token_database = MagicMock()
+        worker.token_database.get_cache_roles.return_value = ["kv"]
         worker.token_database.process_tokens.return_value = [(0, 128, key)]
 
         hit = worker._lookup_with_coordinator(

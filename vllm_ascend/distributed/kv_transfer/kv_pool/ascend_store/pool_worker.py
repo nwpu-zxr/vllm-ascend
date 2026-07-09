@@ -1182,8 +1182,9 @@ class KVPoolWorker:
                 )
 
             if role_exists:
-                for chunk_hash in set(role_exists[0]).intersection(*role_exists[1:]):
-                    exists.add((group_id, chunk_hash))
+                common_chunk_hashes = role_exists[0].intersection(*role_exists[1:])
+                for common_chunk_hash in common_chunk_hashes:
+                    exists.add((group_id, common_chunk_hash))
 
             logger.debug(
                 "KV pool coordinator lookup group=%d token_len=%d keys=%d exists_chunks=%d/%d sample_keys=%s",
