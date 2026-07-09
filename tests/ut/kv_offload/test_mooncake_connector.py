@@ -2742,6 +2742,65 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         tp_num_need_pulls = worker._get_tp_num_need_pulls(prefill_tp_size=None)
         self.assertEqual(tp_num_need_pulls, 1)
 
+    def test_sfa_replicated_indexer_remote_config_validation(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.enable_sfa_dcp_replicated_indexer = True
+        worker._prefill_tp_size = 2
+
+        valid_meta = types.SimpleNamespace(
+            remote_pcp_size=1,
+            remote_dcp_size=2,
+            remote_ptp_size=2,
+        )
+        worker._validate_sfa_replicated_indexer_remote_config(cast(ReqMeta, valid_meta))
+
+        invalid_configs = [(2, 2, 2), (1, 2, 4)]
+        for remote_pcp_size, remote_dcp_size, remote_tp_size in invalid_configs:
+            with self.subTest(
+                remote_pcp_size=remote_pcp_size,
+                remote_dcp_size=remote_dcp_size,
+                remote_tp_size=remote_tp_size,
+            ):
+                invalid_meta = types.SimpleNamespace(
+                    remote_pcp_size=remote_pcp_size,
+                    remote_dcp_size=remote_dcp_size,
+                    remote_ptp_size=remote_tp_size,
+                )
+                with self.assertRaises(AssertionError):
+                    worker._validate_sfa_replicated_indexer_remote_config(cast(ReqMeta, invalid_meta))
+
+    def test_sfa_replicated_indexer_validation_is_disabled_with_feature(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.enable_sfa_dcp_replicated_indexer = False
+        invalid_meta = types.SimpleNamespace(
+            remote_pcp_size=2,
+            remote_dcp_size=1,
+            remote_ptp_size=4,
+        )
+
+        worker._validate_sfa_replicated_indexer_remote_config(cast(ReqMeta, invalid_meta))
+
+    def test_get_sfa_replicated_indexer_block_ids(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.enable_sfa_dcp_replicated_indexer = True
+        worker.pcp_size = 1
+        worker.dcp_size = 2
+        worker.block_size = 16
+        meta = types.SimpleNamespace(
+            remote_pcp_size=1,
+            remote_dcp_size=2,
+            remote_block_ids=([10, 11],),
+            local_block_ids=([20],),
+            num_external_tokens=32,
+            num_prompt_blocks=3,
+            num_computed_tokens=16,
+        )
+
+        local_ids, remote_ids = worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
+
+        self.assertEqual(local_ids, ([40, 41],))
+        self.assertEqual(remote_ids, ([21, 22],))
+
 
 if __name__ == "__main__":
     unittest.main()

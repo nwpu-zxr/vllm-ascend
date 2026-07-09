@@ -114,6 +114,47 @@ class MaskedFakeTokenDatabase(FakeTokenDatabase):
         return block_idx < len(masks[kv_cache_group_id]) and masks[kv_cache_group_id][block_idx]
 
 
+class RoleAwareFakeTokenDatabase(FakeTokenDatabase):
+    def get_cache_roles(self, kv_cache_group_id=0):
+        return ["kv", "replicate_k"]
+
+    def process_tokens_with_block_ids(
+        self,
+        token_len,
+        block_hashes,
+        block_ids,
+        mask_num=0,
+        kv_cache_group_id=0,
+        skip_null_blocks=False,
+        cache_role="kv",
+    ):
+        meta = KeyMetadata("m", 0, 0, 0, 0, cache_role=cache_role)
+        for i, _ in enumerate(block_hashes):
+            start = i * self.block_size
+            if start >= token_len:
+                break
+            if start < mask_num:
+                continue
+            block_id = block_ids[i]
+            if skip_null_blocks and cache_role == "kv" and block_id <= 0:
+                continue
+            yield start, min(start + self.block_size, token_len), PoolKey(meta, f"k{i}"), block_id
+
+    def prepare_value(
+        self,
+        start,
+        end,
+        block_ids,
+        kv_cache_group_id=0,
+        cache_role="kv",
+        block_id=None,
+    ):
+        if block_id is None:
+            block_id = block_ids[start // self.block_size]
+        base_addr = 1000 if cache_role == "kv" else 2000
+        return [base_addr + block_id], [end - start], block_id
+
+
 class TestKVTransferThread(unittest.TestCase):
     def _make_thread(self, exists_result=None):
         store = FakeStore(exists_result or [])
@@ -370,6 +411,38 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         keys, _, _ = store.put_calls[0]
         self.assertEqual(len(keys), 1)
 
+    def test_handle_request_stores_kv_and_replicated_indexer_roles(self):
+        store = FakeStore([0, 0])
+        db = RoleAwareFakeTokenDatabase()
+        t = KVCacheStoreSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            dcp_size=2,
+            put_step=1,
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+            group_uses_align_state=[False],
+        )
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
+            current_event=None,
+        )
+        t.add_stored_request("r1")
+        t.request_queue.put(req)
+
+        t._handle_request(req)
+
+        self.assertEqual(len(store.put_calls), 2)
+        self.assertTrue(all("@cache_role:kv" in key for key in store.put_calls[0][0]))
+        self.assertTrue(all("@cache_role:replicate_k" in key for key in store.put_calls[1][0]))
+        self.assertEqual(store.put_calls[0][1], [[1000], [1001]])
+        self.assertEqual(store.put_calls[1][1], [[2000], [2001]])
+
 
 class TestKVCacheStoreRecvingThread(unittest.TestCase):
     def test_handle_request(self):
@@ -424,6 +497,36 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         t._handle_request(req)
         keys, _, _ = store.get_calls[0]
         self.assertEqual(len(keys), 1)
+
+    def test_handle_request_loads_kv_and_replicated_indexer_roles(self):
+        store = FakeStore()
+        db = RoleAwareFakeTokenDatabase()
+        t = KVCacheStoreRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            dcp_size=2,
+            ready_event=threading.Event(),
+            invalid_block_ids=set(),
+            invalid_block_ids_lock=threading.Lock(),
+        )
+        load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=32, can_load=True, token_len=32)
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
+            load_spec=load_spec,
+        )
+        t.request_queue.put(req)
+
+        t._handle_request(req)
+
+        self.assertEqual(len(store.get_calls), 1)
+        keys, addrs, _ = store.get_calls[0]
+        self.assertEqual(len(keys), 4)
+        self.assertEqual(addrs, [[1000], [1001], [2000], [2001]])
 
 
 class TestKVCacheStoreLayerSendingThread(unittest.TestCase):

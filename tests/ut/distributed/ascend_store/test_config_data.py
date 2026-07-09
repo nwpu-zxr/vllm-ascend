@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    REPLICATE_K_CACHE_ROLE,
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
     KeyMetadata,
@@ -226,6 +227,32 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.assertEqual(addr[1], 2000 + 99 * 320)
         self.assertEqual(size[0], 160)
         self.assertEqual(size[1], 320)
+
+    def test_replicated_indexer_uses_role_buffers_and_rank_independent_key(self):
+        metadata = KeyMetadata("deepseek", 1, 2, 3, 0)
+        db = ChunkedTokenDatabase([metadata], block_size=[16], partitions=None)
+        db.set_group_buffers({0: [1000]}, {0: [160]})
+        db.set_group_buffers(
+            {0: [2000]},
+            {0: [320]},
+            cache_role=REPLICATE_K_CACHE_ROLE,
+        )
+
+        self.assertEqual(db.get_cache_roles(0), ["kv", REPLICATE_K_CACHE_ROLE])
+        kv_key = db._make_key_by_hash("hash", cache_role="kv")
+        replicated_key = db._make_key_by_hash("hash", cache_role=REPLICATE_K_CACHE_ROLE)
+        self.assertEqual((kv_key.key_metadata.pcp_rank, kv_key.key_metadata.dcp_rank), (2, 3))
+        self.assertEqual((replicated_key.key_metadata.pcp_rank, replicated_key.key_metadata.dcp_rank), (0, 0))
+
+        kv_addr, kv_size, _ = db.prepare_value(0, 16, [5])
+        replicated_addr, replicated_size, _ = db.prepare_value(
+            0,
+            16,
+            [5],
+            cache_role=REPLICATE_K_CACHE_ROLE,
+        )
+        self.assertEqual((kv_addr, kv_size), ([1800], [160]))
+        self.assertEqual((replicated_addr, replicated_size), ([3600], [320]))
 
     def test_prepare_value_layer(self):
         addr, size, block_id = self.db.prepare_value_layer(0, 16, [5, 6], layer_id=0)

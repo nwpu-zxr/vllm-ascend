@@ -559,6 +559,21 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(len(worker.group_kv_caches_base_addr[0]), 2)
         worker.m_store.register_buffer.assert_called_once()
 
+    def test_enables_sfa_replicated_indexer_for_matching_topology(self):
+        mocks = self._patch_all()
+        mocks["tp_size"].return_value = 2
+        mocks["dcp_ws"].return_value = 2
+        config = self._make_config()
+        sparse_config = MagicMock(spec=["index_topk"])
+        sparse_config.index_topk = 512
+        config.model_config.hf_text_config = sparse_config
+        config.model_config.hf_config = sparse_config
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+        worker = KVPoolWorker(config, use_layerwize=False)
+
+        self.assertTrue(worker.enable_sfa_dcp_replicated_indexer)
+
     def test_start_load_kv_sync(self):
         worker = self._make_worker()
         worker.m_store.get = MagicMock()
