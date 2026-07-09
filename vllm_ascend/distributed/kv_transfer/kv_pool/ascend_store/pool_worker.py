@@ -104,10 +104,7 @@ class KVPoolWorker:
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
         self.enable_sfa_dcp_replicated_indexer = (
-            self.use_sparse
-            and not self.use_compress
-            and self.dcp_size == self.tp_size
-            and self.pcp_size == 1
+            self.use_sparse and not self.use_compress and self.dcp_size == self.tp_size and self.pcp_size == 1
         )
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role

@@ -2231,10 +2231,7 @@ class MooncakeConnectorWorker:
             compress_ratios = getattr(hf_config, "compress_ratios", None)
         self.use_compress = isinstance(compress_ratios, (list, tuple, dict))
         self.enable_sfa_dcp_replicated_indexer = (
-            self.use_sparse
-            and not self.use_compress
-            and self.dcp_size == self.tp_size
-            and self.pcp_size == 1
+            self.use_sparse and not self.use_compress and self.dcp_size == self.tp_size and self.pcp_size == 1
         )
 
         self.num_blocks = self.kv_cache_config.num_blocks

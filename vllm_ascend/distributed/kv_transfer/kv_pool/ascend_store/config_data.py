@@ -345,9 +345,7 @@ class ChunkedTokenDatabase:
 
     def get_cache_roles(self, kv_cache_group_id: int = 0) -> list[str]:
         roles = ["kv"]
-        replicate_k_buffers = getattr(self, "group_kv_caches_base_addr_by_role", {}).get(
-            REPLICATE_K_CACHE_ROLE, {}
-        )
+        replicate_k_buffers = getattr(self, "group_kv_caches_base_addr_by_role", {}).get(REPLICATE_K_CACHE_ROLE, {})
         if replicate_k_buffers.get(kv_cache_group_id):
             roles.append(REPLICATE_K_CACHE_ROLE)
         return roles
