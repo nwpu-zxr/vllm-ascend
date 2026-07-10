@@ -1482,6 +1482,21 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
 
         self.assertEqual(block_ids, ([30, 31],))
 
+    def test_get_transfer_block_ids_uses_cp_grouped_block_len(self):
+        self.scheduler.pcp_size = 1
+        self.scheduler.dcp_size = 4
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(  # type: ignore[list-item]
+                tokens_per_block=16,
+                blocks_per_window=0,
+                is_state_group=False,
+            )
+        ]
+
+        block_ids = self.scheduler._get_transfer_block_ids(([10, 11, 12, 13, 14],), prompt_len=65)
+
+        self.assertEqual(block_ids, ([10, 11],))
+
     def test_get_transfer_block_ids_trims_sliding_window_mtp_blocks(self):
         self.scheduler.group_transfer_info = [
             types.SimpleNamespace(  # type: ignore[list-item]
@@ -1553,6 +1568,28 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(params["remote_block_ids"], ([10, 11, 12],))
         self.assertEqual(params["num_prompt_blocks"], 3)
         self.assertIn("req_mtp", self.scheduler._reqs_need_send)
+
+    def test_request_finished_trims_cp_grouped_mtp_blocks_in_params(self):
+        self.scheduler.pcp_size = 1
+        self.scheduler.dcp_size = 4
+        self.scheduler.group_transfer_info = [
+            types.SimpleNamespace(
+                tokens_per_block=16,
+                blocks_per_window=0,
+                is_state_group=False,
+            )
+        ]
+        request = self._make_remote_decode_request(prompt_len=65, request_id="req_cp_mtp")
+
+        delay_free, params = self.scheduler.request_finished(request, ([10, 11, 12, 13, 14],))
+
+        self.assertTrue(delay_free)
+        self.assertIsNotNone(params)
+        assert params is not None
+        self.assertEqual(params["remote_block_ids"], ([10, 11],))
+        # num_prompt_blocks stays in no-CP units for worker-side CP distribution.
+        self.assertEqual(params["num_prompt_blocks"], 5)
+        self.assertIn("req_cp_mtp", self.scheduler._reqs_need_send)
 
     def test_request_finished_clips_sliding_window_blocks_in_params(self):
         self.scheduler.group_transfer_info = [
