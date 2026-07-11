@@ -80,6 +80,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             qli_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
             qli_scale_bytes = (
                 num_heads_per_page * self.sfa_dcp_replicated_indexer_size * get_dtype_size(self.c8_k_scale_cache_dtype)
+                if index_head_dim > 0
+                else 0
             )
             return kv_bytes + qli_bytes + qli_scale_bytes
 
@@ -90,7 +92,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         )
 
     @property
-    def sparse_kv_cache_ratio(self) -> tuple[float, float, float, float | None]:
+    def sparse_kv_cache_ratio(self) -> tuple[float, float | None, float | None, float | None]:
         """
         Compute the relative byte share of each KV cache entry.
 
@@ -156,7 +158,9 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         return (
             self.head_size / self.sparse_head_dim[0],  # kv_cache[0]
             self.head_size / self.sparse_head_dim[1],  # kv_cache[1]
-            self.head_size / self.sparse_head_dim[2],  # kv_cache[2]
+            (
+                self.head_size / self.sparse_head_dim[2] if self.sparse_head_dim[2] > 0 else None
+            ),  # kv_cache[2]
             None,  # kv_cache[3] does not exist
         )
 

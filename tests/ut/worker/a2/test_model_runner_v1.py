@@ -7,6 +7,7 @@ import torch
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -138,6 +139,28 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(raw_k_cache.numel(), 2 * 16 * 512 * 2)
         self.assertEqual(raw_v_cache.numel(), 2 * 16 * 64 * 2)
+
+    def test_sparse_replicated_indexer_page_size_uses_expanded_storage_once(self):
+        spec = AscendMLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1088,
+            sparse_head_dim=(512, 64, 128 * 4),
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+            sfa_dcp_replicated_indexer_size=4,
+        )
+
+        self.assertEqual(spec.page_size_bytes, 16 * (512 + 64 + 128 * 4) * 2)
+        self.assertEqual(
+            spec.sparse_kv_cache_ratio,
+            (
+                (512 + 64 + 128 * 4) / 512,
+                (512 + 64 + 128 * 4) / 64,
+                (512 + 64 + 128 * 4) / (128 * 4),
+                None,
+            ),
+        )
 
 
 class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):

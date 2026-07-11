@@ -1124,6 +1124,7 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         meta.add_new_req(
             request_id="req1",
             local_block_ids=[1, 2, 3],
+            local_full_block_ids=[0, 1, 2, 3],
             num_external_tokens=48,
             kv_transfer_params={
                 "remote_block_ids": [4, 5, 6],
@@ -1141,6 +1142,7 @@ class TestMooncakeConnectorMetadata(unittest.TestCase):
         req_meta = meta.requests["req1"]
         self.assertIsInstance(req_meta, ReqMeta)
         self.assertEqual(req_meta.local_block_ids, [1, 2, 3])
+        self.assertEqual(req_meta.local_full_block_ids, [0, 1, 2, 3])
         self.assertEqual(req_meta.remote_block_ids, [4, 5, 6])
         self.assertEqual(req_meta.remote_engine_id, "remote_engine")
         self.assertEqual(req_meta.remote_host, "localhost")
@@ -1178,9 +1180,7 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
 
     def test_build_connector_meta(self):
         request = MockRequest("req1")
-        blocks_mock = MagicMock()
-        blocks_mock.get_unhashed_block_ids.return_value = [4, 5, 6]
-        self.scheduler._reqs_need_recv["req1"] = (request, [4, 5, 6], 48)
+        self.scheduler._reqs_need_recv["req1"] = (request, [4, 5, 6], [0, 4, 5, 6], 48)
         request.kv_transfer_params = {
             "remote_block_ids": [1, 2, 3],
             "remote_engine_id": "remote",
@@ -1196,6 +1196,7 @@ class TestMooncakeConnectorSchedulerMatchedTokens(unittest.TestCase):
         self.assertIsInstance(meta, MooncakeConnectorMetadata)
         self.assertEqual(len(meta.requests), 1)
         self.assertEqual(meta.requests["req1"].local_block_ids, [4, 5, 6])
+        self.assertEqual(meta.requests["req1"].local_full_block_ids, [0, 4, 5, 6])
         self.assertEqual(meta.requests["req1"].remote_block_ids, [1, 2, 3])
         self.assertEqual(meta.requests["req1"].num_computed_tokens, 16)
         self.assertEqual(len(self.scheduler._reqs_need_recv), 0)
@@ -1296,6 +1297,9 @@ class MockKVCacheBlocks:
 
     def get_unhashed_block_ids_all_groups(self):
         return ([4, 5, 6],)
+
+    def get_block_ids(self):
+        return ([1, 2, 4, 5, 6],)
 
 
 class MockSchedulerOutput:
@@ -1436,6 +1440,7 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(len(self.scheduler._reqs_need_recv), 1)
         self.assertEqual(self.scheduler._reqs_need_recv["req1"][0], request)
         self.assertEqual(self.scheduler._reqs_need_recv["req1"][1], ([4, 5, 6],))
+        self.assertEqual(self.scheduler._reqs_need_recv["req1"][2], ([1, 2, 4, 5, 6],))
 
     def test_request_finished_no_remote_decode(self):
         request = MockRequest("req1")
@@ -2817,7 +2822,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
         worker._validate_sfa_replicated_indexer_remote_config(cast(ReqMeta, invalid_meta))
 
-    def test_get_sfa_replicated_indexer_block_ids(self):
+    def test_get_sfa_replicated_indexer_block_ids_uses_full_blocks_for_prefix(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.enable_sfa_dcp_replicated_indexer = True
         worker.pcp_size = 1
@@ -2828,6 +2833,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             remote_dcp_size=2,
             remote_block_ids=([10, 11],),
             local_block_ids=([20],),
+            local_full_block_ids=([19, 20],),
             num_external_tokens=32,
             num_prompt_blocks=3,
             num_computed_tokens=16,
@@ -2835,8 +2841,28 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
         local_ids, remote_ids = worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
 
-        self.assertEqual(local_ids, ([40, 41],))
+        self.assertEqual(local_ids, ([39, 40],))
         self.assertEqual(remote_ids, ([21, 22],))
+
+    def test_get_sfa_replicated_indexer_block_ids_requires_full_blocks_for_prefix(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.enable_sfa_dcp_replicated_indexer = True
+        worker.pcp_size = 1
+        worker.dcp_size = 2
+        worker.block_size = 16
+        meta = types.SimpleNamespace(
+            remote_pcp_size=1,
+            remote_dcp_size=2,
+            remote_block_ids=([10, 11],),
+            local_block_ids=([20],),
+            local_full_block_ids=tuple(),
+            num_external_tokens=32,
+            num_prompt_blocks=3,
+            num_computed_tokens=16,
+        )
+
+        with self.assertRaises(AssertionError):
+            worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
 
 
 if __name__ == "__main__":
